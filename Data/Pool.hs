@@ -290,6 +290,29 @@ takeResource pool@Pool{..} = do
 {-# INLINABLE takeResource #-}
 #endif
 
+-- | Similar to 'takeEntry' but returns Nothing if the pool is full.
+tryTakeEntry :: Pool a -> IO (Maybe (Entry a, LocalPool a))
+tryTakeEntry pool@Pool{..} = do
+  local@LocalPool{..} <- getLocalPool pool
+  resource <- join . atomically $ do
+    ents <- readTVar entries
+    case ents of
+      (entry:es) -> writeTVar entries es >> return (return . Just $ entry)
+      [] -> do
+        used <- readTVar inUse
+        if used == maxResources
+          then return (return Nothing)
+          else do
+            writeTVar inUse $! used + 1
+            return $ do
+              now <- getCurrentTime
+              entry <- create `onException` atomically (modifyTVar_ inUse (subtract 1))
+              return $ Just Entry{lastUse=now, entry=entry}
+  return $ (flip (,) local) <$> resource
+#if __GLASGOW_HASKELL__ >= 700
+{-# INLINABLE tryTakeEntry #-}
+#endif
+
 -- | Similar to 'withResource', but only performs the action if a resource could
 -- be taken from the pool /without blocking/. Otherwise, 'tryWithResource'
 -- returns immediately with 'Nothing' (ie. the action function is /not/ called).
@@ -303,14 +326,25 @@ tryWithResource :: forall m a b.
 #endif
   => Pool a -> (a -> m b) -> m (Maybe b)
 tryWithResource pool act = control $ \runInIO -> mask $ \restore -> do
-  res <- tryTakeResource pool
+  res <- tryTakeEntry pool
+  now <- getCurrentTime
+
   case res of
-    Just (resource, local) -> do
+    Just (Entry{..}, local) -> do
+      resource <- if now `diffUTCTime` lastUse >= idleTime pool
+        then liftBase $ do
+          destroyResource pool local entry
+          create pool
+        else
+          return entry
+
       ret <- restore (runInIO (Just <$> act resource)) `onException`
                 destroyResource pool local resource
       putResource local resource
       return ret
-    Nothing -> restore . runInIO $ return (Nothing :: Maybe b)
+
+    Nothing ->
+      restore . runInIO $ return (Nothing :: Maybe b)
 #if __GLASGOW_HASKELL__ >= 700
 {-# INLINABLE tryWithResource #-}
 #endif
